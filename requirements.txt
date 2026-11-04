@@ -1,0 +1,8 @@
+numpy
+pandas
+scikit-learn
+pyod
+xgboost
+numba
+scipy
+pytest

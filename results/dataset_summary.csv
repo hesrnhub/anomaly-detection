@@ -1,0 +1,13 @@
+Dataset,Sampel,Fitur,Anomali,Rasio anomali (%)
+18_Ionosphere,351,32,126,35.9
+20_letter,1600,32,100,6.25
+26_optdigits,5216,64,150,2.88
+28_pendigits,6870,16,156,2.27
+29_Pima,768,8,268,34.9
+2_annthyroid,7200,6,534,7.42
+30_satellite,6435,36,2036,31.64
+31_satimage-2,5803,36,71,1.22
+40_vowels,1456,12,50,3.43
+4_breastw,683,9,239,34.99
+6_cardio,1831,21,176,9.61
+7_Cardiotocography,2114,21,466,22.04
