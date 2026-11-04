@@ -11,6 +11,13 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["MPLCONFIGDIR"] = os.path.join(tempfile.gettempdir(), "matplotlib_tmp")
 
+# Models are trained one at a time, never concurrently with each other, so
+# letting each estimator's own joblib-based parallelism use multiple cores
+# is safe here and speeds up fitting. (The OMP/OPENBLAS/MKL thread caps
+# above only limit the BLAS layer, which is a separate thread pool, so
+# there's no oversubscription conflict with this.)
+N_JOBS = max(1, (os.cpu_count() or 2) - 1)
+
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score
@@ -19,6 +26,7 @@ from sklearn.ensemble import IsolationForest, RandomForestClassifier
 from sklearn.neighbors import NearestNeighbors
 from sklearn.linear_model import LogisticRegression
 from sklearn.decomposition import PCA
+from scipy.spatial.distance import cdist
 
 def load_npz_dataset(filepath):
     data = np.load(filepath)
@@ -42,19 +50,21 @@ class BaseDetector:
 
 class ECODDetector(BaseDetector):
     def __init__(self):
-        self.X_train = None
+        self.sorted_train = None
 
     def fit(self, X_train, y_train=None):
-        self.X_train = np.copy(X_train)
+        # Sort each feature column once here, instead of re-sorting it on
+        # every predict_score() call (sorting is O(n log n) per column).
+        self.sorted_train = np.sort(X_train, axis=0)
         return self
 
     def predict_score(self, X_test):
-        n_train, n_feats = self.X_train.shape
+        n_train, n_feats = self.sorted_train.shape
         scores = np.zeros(X_test.shape[0], dtype=np.float64)
         
         eps = 1e-10
         for j in range(n_feats):
-            feat_train = np.sort(self.X_train[:, j])
+            feat_train = self.sorted_train[:, j]
             feat_test = X_test[:, j]
             
             # Left tail ECDF
@@ -118,7 +128,7 @@ class KNNDetector(BaseDetector):
 
     def fit(self, X_train, y_train=None):
         k_val = min(self.k, len(X_train))
-        self.model = NearestNeighbors(n_neighbors=k_val, algorithm='auto', n_jobs=1)
+        self.model = NearestNeighbors(n_neighbors=k_val, algorithm='auto', n_jobs=N_JOBS)
         self.model.fit(X_train)
         return self
 
@@ -147,7 +157,7 @@ class PCADetector(BaseDetector):
 
 class IForestDetector(BaseDetector):
     def __init__(self, n_estimators=100, random_state=42):
-        self.model = IsolationForest(n_estimators=n_estimators, random_state=random_state, n_jobs=1)
+        self.model = IsolationForest(n_estimators=n_estimators, random_state=random_state, n_jobs=N_JOBS)
 
     def fit(self, X_train, y_train=None):
         self.model.fit(X_train)
@@ -161,7 +171,7 @@ class IForestDetector(BaseDetector):
 
 class SupervisedRFDetector(BaseDetector):
     def __init__(self, n_estimators=100, random_state=42):
-        self.model = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, class_weight='balanced', n_jobs=1)
+        self.model = RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, class_weight='balanced', n_jobs=N_JOBS)
 
     def fit(self, X_train, y_train=None):
         if y_train is None or len(np.unique(y_train)) < 2:
@@ -201,7 +211,9 @@ class SemiSupervisedDetector(BaseDetector):
         unsup_norm = (unsup_scores - np.min(unsup_scores)) / (np.ptp(unsup_scores) + 1e-10)
         
         # Jarak ke anomali yang diketahui (makin dekat = makin tinggi kemiripan)
-        dists = np.min(np.linalg.norm(X_test[:, np.newaxis, :] - self.known_anomalies[np.newaxis, :, :], axis=2), axis=1)
+        # cdist uses an optimized BLAS routine instead of materializing a full
+        # (n_test, n_labeled, n_feats) temporary array via broadcasting.
+        dists = np.min(cdist(X_test, self.known_anomalies), axis=1)
         sim_scores = 1.0 / (1.0 + dists)
         sim_norm = (sim_scores - np.min(sim_scores)) / (np.ptp(sim_scores) + 1e-10)
         
@@ -239,20 +251,22 @@ class DataQualityStressTest:
         rng = np.random.default_rng(random_state)
         n_samples, n_feats = X.shape
         n_noisy_feats = max(1, int(round(n_feats * noise_ratio)))
-        
-        noisy_cols = []
-        for _ in range(n_noisy_feats):
-            # Pilih satu fitur acak sebagai referensi batas min/max
-            k = rng.integers(0, n_feats)
-            col_min = np.min(X[:, k])
-            col_max = np.max(X[:, k])
-            if col_min == col_max:
-                noise_col = rng.normal(col_min, 1.0, size=n_samples)
-            else:
-                noise_col = rng.uniform(col_min, col_max, size=n_samples)
-            noisy_cols.append(noise_col.reshape(-1, 1))
-            
-        X_corrupted = np.hstack([X] + noisy_cols)
+
+        # Pilih fitur acak sebagai referensi batas min/max untuk tiap kolom noise
+        ref_cols = rng.integers(0, n_feats, size=n_noisy_feats)
+        col_min = np.min(X[:, ref_cols], axis=0)
+        col_max = np.max(X[:, ref_cols], axis=0)
+        degenerate = col_min == col_max
+
+        # Bangkitkan semua kolom noise sekaligus (vectorized) alih-alih
+        # satu per satu dalam loop Python.
+        noise = rng.uniform(0.0, 1.0, size=(n_samples, n_noisy_feats))
+        uniform_cols = col_min + noise * (col_max - col_min)
+        if np.any(degenerate):
+            normal_cols = rng.normal(0.0, 1.0, size=(n_samples, n_noisy_feats)) + col_min
+            uniform_cols = np.where(degenerate, normal_cols, uniform_cols)
+
+        X_corrupted = np.hstack([X, uniform_cols])
         return X_corrupted
 
     @staticmethod
@@ -294,11 +308,13 @@ class SyntheticAnomalyGenerator:
 
         elif anomaly_type == "dependency":
             # Dependency: merusak korelasi antar fitur (permutasi independen per kolom)
-            anomalies = np.zeros((n_anomalies, n_feats))
             sample_idx = rng.choice(n_normal, size=n_anomalies, replace=True)
             subset = X_normal[sample_idx]
-            for j in range(n_feats):
-                anomalies[:, j] = rng.permutation(subset[:, j])
+            # Independent per-column permutation, vectorized: argsort a matrix
+            # of random keys (one random ordering per column) then gather,
+            # instead of calling rng.permutation() in a Python loop per column.
+            perm_idx = np.argsort(rng.random(subset.shape), axis=0)
+            anomalies = np.take_along_axis(subset, perm_idx, axis=0)
 
         elif anomaly_type == "clustered":
             # Clustered / Group anomalies: pergeseran cluster mean alpha = 5
